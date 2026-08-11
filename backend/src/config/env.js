@@ -29,7 +29,7 @@ module.exports = {
     port: process.env.SMTP_PORT,
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
-    from: process.env.EMAIL_FROM || 'MindMitra <noreply@mindmitra.app>',
+    from: process.env.EMAIL_FROM,
   },
   geminiApiKey: process.env.GEMINI_API_KEY,
   rateLimit: {
