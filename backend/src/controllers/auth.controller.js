@@ -6,6 +6,7 @@ const ApiError = require('../utils/ApiError');
 const ApiResponse = require('../utils/ApiResponse');
 const asyncHandler = require('../utils/asyncHandler');
 const env = require('../config/env');
+const logger = require('../utils/logger');
 const { accessTokenCookieOptions, refreshTokenCookieOptions, generateTokensForUser } = require('../services/token.service');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/email.service');
 
@@ -35,12 +36,45 @@ const register = asyncHandler(async (req, res) => {
   const verifyRawToken = user.generateEmailVerificationToken();
   await user.save();
 
+  // Auto-login on registration: mint the same access/refresh tokens and
+  // cookies that login() issues, so the frontend can store the token,
+  // update auth state, and redirect straight to the dashboard without
+  // forcing the user through a separate login step.
+  const { accessToken } = await generateTokensForUser(user);
+  user.lastLogin = new Date();
+  await user.save({ validateBeforeSave: false });
+
+  // Fire the verification email in the background instead of awaiting it
+  // before responding. SMTP calls can be slow or hang (bad host/port,
+  // network restrictions, wrong creds); blocking the response on it means
+  // the user is already in Mongo but the frontend request — and therefore
+  // the loading spinner — never resolves. Registration must succeed
+  // (requirement 10) regardless of whether the email goes out.
   const verifyUrl = `${env.clientUrl}/verify-email/${verifyRawToken}`;
-  await sendVerificationEmail(user.email, verifyUrl);
+  const emailQueued = true;
+  sendVerificationEmail(user.email, verifyUrl)
+    .then((result) => {
+      if (!result?.sent) {
+        logger.warn(`Verification email not sent for ${user.email}: ${result?.reason}`);
+      }
+    })
+    .catch((err) => {
+      // sendVerificationEmail/sendEmail already catches internally, but this
+      // guards against any future change reintroducing an unhandled rejection.
+      logger.error(`Unexpected error sending verification email to ${user.email}:`, err.message);
+    });
 
   return res
     .status(StatusCodes.CREATED)
-    .json(new ApiResponse(StatusCodes.CREATED, sanitizeUser(user), 'Account created. Please check your email to verify your account.'));
+    .cookie('accessToken', accessToken, accessTokenCookieOptions)
+    .cookie('refreshToken', user.refreshToken, refreshTokenCookieOptions)
+    .json(
+      new ApiResponse(
+        StatusCodes.CREATED,
+        { user: sanitizeUser(user), accessToken, emailQueued },
+        'Account created successfully.'
+      )
+    );
 });
 
 const login = asyncHandler(async (req, res) => {

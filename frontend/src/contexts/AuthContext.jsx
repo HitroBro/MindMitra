@@ -36,7 +36,9 @@ export const AuthProvider = ({ children }) => {
 
   const register = useCallback(async (payload) => {
     const { data } = await authApi.register(payload);
-    return data.data;
+    setAccessToken(data.data.accessToken);
+    setUser(data.data.user);
+    return data.data.user;
   }, []);
 
   const logout = useCallback(async () => {

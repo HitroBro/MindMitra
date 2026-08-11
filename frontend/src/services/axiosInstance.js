@@ -5,6 +5,7 @@ const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api/v1';
 const axiosInstance = axios.create({
   baseURL: API_URL,
   withCredentials: true, // send httpOnly refresh cookie
+  timeout: 20_000, // fail fast instead of leaving callers (and spinners) hanging forever
 });
 
 let accessToken = null;

@@ -1,0 +1,197 @@
+diff --git a/backend/render.yaml b/backend/render.yaml
+index c0395f7..32d4e32 100644
+--- a/backend/render.yaml
++++ b/backend/render.yaml
+@@ -30,3 +30,13 @@ services:
+         sync: false
+       - key: CLOUDINARY_API_SECRET
+         sync: false
++      - key: SMTP_HOST
++        sync: false
++      - key: SMTP_PORT
++        sync: false
++      - key: SMTP_USER
++        sync: false
++      - key: SMTP_PASS
++        sync: false
++      - key: EMAIL_FROM
++        sync: false
+diff --git a/backend/src/controllers/auth.controller.js b/backend/src/controllers/auth.controller.js
+index 1bc93b5..408eb2e 100644
+--- a/backend/src/controllers/auth.controller.js
++++ b/backend/src/controllers/auth.controller.js
+@@ -6,6 +6,7 @@ const ApiError = require('../utils/ApiError');
+ const ApiResponse = require('../utils/ApiResponse');
+ const asyncHandler = require('../utils/asyncHandler');
+ const env = require('../config/env');
++const logger = require('../utils/logger');
+ const { accessTokenCookieOptions, refreshTokenCookieOptions, generateTokensForUser } = require('../services/token.service');
+ const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/email.service');
+ 
+@@ -35,12 +36,45 @@ const register = asyncHandler(async (req, res) => {
+   const verifyRawToken = user.generateEmailVerificationToken();
+   await user.save();
+ 
++  // Auto-login on registration: mint the same access/refresh tokens and
++  // cookies that login() issues, so the frontend can store the token,
++  // update auth state, and redirect straight to the dashboard without
++  // forcing the user through a separate login step.
++  const { accessToken } = await generateTokensForUser(user);
++  user.lastLogin = new Date();
++  await user.save({ validateBeforeSave: false });
++
++  // Fire the verification email in the background instead of awaiting it
++  // before responding. SMTP calls can be slow or hang (bad host/port,
++  // network restrictions, wrong creds); blocking the response on it means
++  // the user is already in Mongo but the frontend request — and therefore
++  // the loading spinner — never resolves. Registration must succeed
++  // (requirement 10) regardless of whether the email goes out.
+   const verifyUrl = `${env.clientUrl}/verify-email/${verifyRawToken}`;
+-  await sendVerificationEmail(user.email, verifyUrl);
++  const emailQueued = true;
++  sendVerificationEmail(user.email, verifyUrl)
++    .then((result) => {
++      if (!result?.sent) {
++        logger.warn(`Verification email not sent for ${user.email}: ${result?.reason}`);
++      }
++    })
++    .catch((err) => {
++      // sendVerificationEmail/sendEmail already catches internally, but this
++      // guards against any future change reintroducing an unhandled rejection.
++      logger.error(`Unexpected error sending verification email to ${user.email}:`, err.message);
++    });
+ 
+   return res
+     .status(StatusCodes.CREATED)
+-    .json(new ApiResponse(StatusCodes.CREATED, sanitizeUser(user), 'Account created. Please check your email to verify your account.'));
++    .cookie('accessToken', accessToken, accessTokenCookieOptions)
++    .cookie('refreshToken', user.refreshToken, refreshTokenCookieOptions)
++    .json(
++      new ApiResponse(
++        StatusCodes.CREATED,
++        { user: sanitizeUser(user), accessToken, emailQueued },
++        'Account created successfully.'
++      )
++    );
+ });
+ 
+ const login = asyncHandler(async (req, res) => {
+diff --git a/backend/src/services/email.service.js b/backend/src/services/email.service.js
+index 04b0f0d..afc9ced 100644
+--- a/backend/src/services/email.service.js
++++ b/backend/src/services/email.service.js
+@@ -2,20 +2,57 @@ const nodemailer = require('nodemailer');
+ const env = require('../config/env');
+ const logger = require('../utils/logger');
+ 
++const smtpPort = Number(env.smtp.port) || 587;
++
+ const transporter = nodemailer.createTransport({
+   host: env.smtp.host,
+-  port: Number(env.smtp.port) || 587,
+-  secure: false,
++  port: smtpPort,
++  // Port 465 requires implicit TLS from the first byte of the connection.
++  // Hardcoding this to `false` (as it was) makes nodemailer try STARTTLS on
++  // a port that expects TLS immediately, so the handshake never completes —
++  // the socket just sits open until it eventually times out. Ports 587/25
++  // use STARTTLS (secure: false), so infer this from the port instead of
++  // hardcoding it.
++  secure: smtpPort === 465,
+   auth: env.smtp.user ? { user: env.smtp.user, pass: env.smtp.pass } : undefined,
++  // Previously unset, which meant a firewalled/unreachable/misconfigured
++  // SMTP host (e.g. Render blocking the port, wrong host, bad creds that
++  // hang on AUTH) would hang the socket close to indefinitely. Fail fast
++  // instead so callers get a rejected promise, not a stuck connection.
++  connectionTimeout: 10_000, // time to establish the TCP connection
++  greetingTimeout: 10_000, // time to receive the SMTP greeting
++  socketTimeout: 15_000, // time for the whole exchange to complete
+ });
+ 
++// Verify the SMTP connection once at boot (non-blocking) so misconfiguration
++// shows up clearly in Render logs instead of silently failing on first use.
++if (env.smtp.user) {
++  transporter
++    .verify()
++    .then(() => logger.info('SMTP transporter verified and ready to send email'))
++    .catch((err) => logger.error('SMTP transporter verification failed:', err.message));
++} else {
++  logger.warn('SMTP not configured (SMTP_USER missing) — emails will be skipped');
++}
++
+ const sendEmail = async ({ to, subject, html }) => {
+   if (!env.smtp.user) {
+     // SMTP not configured yet (fine for local dev) — log instead of throwing
+     logger.warn(`SMTP not configured. Skipping email to ${to}: ${subject}`);
+-    return;
++    return { sent: false, reason: 'SMTP_NOT_CONFIGURED' };
++  }
++
++  try {
++    await transporter.sendMail({ from: env.smtp.from, to, subject, html });
++    logger.info(`Email sent to ${to}: ${subject}`);
++    return { sent: true };
++  } catch (err) {
++    // Never let an email failure throw an unhandled rejection into a caller
++    // that might be awaiting this inline on a request path — log it and
++    // report failure back to the caller so it can decide what to do.
++    logger.error(`Failed to send email to ${to} (${subject}):`, err.message);
++    return { sent: false, reason: err.message };
+   }
+-  await transporter.sendMail({ from: env.smtp.from, to, subject, html });
+ };
+ 
+ const sendVerificationEmail = (to, verifyUrl) =>
+diff --git a/frontend/src/contexts/AuthContext.jsx b/frontend/src/contexts/AuthContext.jsx
+index 2012ed8..bdb9fb4 100644
+--- a/frontend/src/contexts/AuthContext.jsx
++++ b/frontend/src/contexts/AuthContext.jsx
+@@ -36,7 +36,9 @@ export const AuthProvider = ({ children }) => {
+ 
+   const register = useCallback(async (payload) => {
+     const { data } = await authApi.register(payload);
+-    return data.data;
++    setAccessToken(data.data.accessToken);
++    setUser(data.data.user);
++    return data.data.user;
+   }, []);
+ 
+   const logout = useCallback(async () => {
+diff --git a/frontend/src/pages/auth/RegisterPage.jsx b/frontend/src/pages/auth/RegisterPage.jsx
+index 409c1a8..de18085 100644
+--- a/frontend/src/pages/auth/RegisterPage.jsx
++++ b/frontend/src/pages/auth/RegisterPage.jsx
+@@ -15,6 +15,8 @@ const schema = z.object({
+   role: z.enum(['student', 'volunteer', 'counselor']),
+ });
+ 
++const roleHome = { student: '/dashboard/student', volunteer: '/dashboard/volunteer', counselor: '/dashboard/counselor', admin: '/dashboard/admin' };
++
+ const RegisterPage = () => {
+   const { register: registerUser } = useAuth();
+   const navigate = useNavigate();
+@@ -28,9 +30,9 @@ const RegisterPage = () => {
+   const onSubmit = async (data) => {
+     setSubmitting(true);
+     try {
+-      await registerUser(data);
+-      toast.success('Account created! Please check your email to verify, then log in.');
+-      navigate('/login');
++      const user = await registerUser(data);
++      toast.success(`Welcome to MindMitra, ${user.name.split(' ')[0]}! We've sent a verification link to your email.`);
++      navigate(roleHome[user.role] || '/', { replace: true });
+     } catch (err) {
+       toast.error(err.response?.data?.message || 'Registration failed');
+     } finally {
+diff --git a/frontend/src/services/axiosInstance.js b/frontend/src/services/axiosInstance.js
+index 6d62b0d..95cdda3 100644
+--- a/frontend/src/services/axiosInstance.js
++++ b/frontend/src/services/axiosInstance.js
+@@ -5,6 +5,7 @@ const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api/v1';
+ const axiosInstance = axios.create({
+   baseURL: API_URL,
+   withCredentials: true, // send httpOnly refresh cookie
++  timeout: 20_000, // fail fast instead of leaving callers (and spinners) hanging forever
+ });
+ 
+ let accessToken = null;

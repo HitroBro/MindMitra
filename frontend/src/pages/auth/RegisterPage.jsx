@@ -15,6 +15,8 @@ const schema = z.object({
   role: z.enum(['student', 'volunteer', 'counselor']),
 });
 
+const roleHome = { student: '/dashboard/student', volunteer: '/dashboard/volunteer', counselor: '/dashboard/counselor', admin: '/dashboard/admin' };
+
 const RegisterPage = () => {
   const { register: registerUser } = useAuth();
   const navigate = useNavigate();
@@ -28,9 +30,9 @@ const RegisterPage = () => {
   const onSubmit = async (data) => {
     setSubmitting(true);
     try {
-      await registerUser(data);
-      toast.success('Account created! Please check your email to verify, then log in.');
-      navigate('/login');
+      const user = await registerUser(data);
+      toast.success(`Welcome to MindMitra, ${user.name.split(' ')[0]}! We've sent a verification link to your email.`);
+      navigate(roleHome[user.role] || '/', { replace: true });
     } catch (err) {
       toast.error(err.response?.data?.message || 'Registration failed');
     } finally {
