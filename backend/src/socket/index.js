@@ -5,6 +5,7 @@ const logger = require('../utils/logger');
 
 let io;
 const userSocketMap = new Map(); // userId -> socketId
+const sessionReadyRooms = new Set();
 
 const initSocket = (httpServer) => {
   io = new Server(httpServer, {
@@ -50,9 +51,24 @@ const initSocket = (httpServer) => {
         const studentId = String(appt.student);
         const counselorId = String(appt.counselor);
         if (uid !== studentId && uid !== counselorId) return socket.emit('session:error', { message: 'Not a participant' });
+
         socket.join(`session:${sessionId}`);
+        logger.info(`Session joined: user ${uid} joined room session:${sessionId}`);
         socket.emit('session:joined', { sessionId });
+
+        const clients = await io.in(`session:${sessionId}`).fetchSockets();
+        const participantCount = clients.filter((s) => {
+          const user = String(s.userId);
+          return user === studentId || user === counselorId;
+        }).length;
+
+        if (participantCount === 2 && !sessionReadyRooms.has(sessionId)) {
+          sessionReadyRooms.add(sessionId);
+          logger.info(`Session ready: session:${sessionId}`);
+          io.in(`session:${sessionId}`).emit('session:ready', { sessionId });
+        }
       } catch (err) {
+        logger.error('session:join error', err);
         socket.emit('session:error', { message: 'Failed to join session' });
       }
     });
@@ -64,17 +80,26 @@ const initSocket = (httpServer) => {
     // WebRTC signaling relay: clients send messages with { targetUserId, payload }
     socket.on('webrtc:offer', ({ targetUserId, offer }) => {
       const to = userSocketMap.get(String(targetUserId));
-      if (to) io.to(to).emit('webrtc:offer', { fromUserId: socket.userId, offer });
+      if (to) {
+        logger.info(`Offer relayed from ${socket.userId} to ${targetUserId}`);
+        io.to(to).emit('webrtc:offer', { fromUserId: socket.userId, offer });
+      }
     });
 
     socket.on('webrtc:answer', ({ targetUserId, answer }) => {
       const to = userSocketMap.get(String(targetUserId));
-      if (to) io.to(to).emit('webrtc:answer', { fromUserId: socket.userId, answer });
+      if (to) {
+        logger.info(`Answer relayed from ${socket.userId} to ${targetUserId}`);
+        io.to(to).emit('webrtc:answer', { fromUserId: socket.userId, answer });
+      }
     });
 
     socket.on('webrtc:ice', ({ targetUserId, candidate }) => {
       const to = userSocketMap.get(String(targetUserId));
-      if (to) io.to(to).emit('webrtc:ice', { fromUserId: socket.userId, candidate });
+      if (to) {
+        logger.info(`ICE relayed from ${socket.userId} to ${targetUserId}`);
+        io.to(to).emit('webrtc:ice', { fromUserId: socket.userId, candidate });
+      }
     });
   });
 
