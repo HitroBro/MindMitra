@@ -139,17 +139,29 @@ const forgotPassword = asyncHandler(async (req, res) => {
   const { email } = req.body;
   const user = await User.findOne({ email });
 
-  // Always respond the same way to avoid leaking whether an email is registered
   if (user) {
     const rawToken = user.generatePasswordResetToken();
     await user.save({ validateBeforeSave: false });
     const resetUrl = `${env.clientUrl}/reset-password/${rawToken}`;
-    await sendPasswordResetEmail(user.email, resetUrl);
+
+    sendPasswordResetEmail(user.email, resetUrl)
+      .then((result) => {
+        if (!result?.sent) {
+          logger.warn(`Password reset email not sent for ${user.email}: ${result?.reason}`);
+        }
+      })
+      .catch((err) => {
+        logger.error(`Unexpected error sending password reset email:`, err.message);
+      });
   }
 
-  return res
-    .status(StatusCodes.OK)
-    .json(new ApiResponse(StatusCodes.OK, null, 'If that email is registered, a reset link has been sent.'));
+  return res.status(StatusCodes.OK).json(
+    new ApiResponse(
+      StatusCodes.OK,
+      null,
+      'If that email is registered, a reset link has been sent.'
+    )
+  );
 });
 
 const resetPassword = asyncHandler(async (req, res) => {

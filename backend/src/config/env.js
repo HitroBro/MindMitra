@@ -24,13 +24,10 @@ module.exports = {
     apiKey: process.env.CLOUDINARY_API_KEY,
     apiSecret: process.env.CLOUDINARY_API_SECRET,
   },
-  smtp: {
-    host: process.env.SMTP_HOST,
-    port: process.env.SMTP_PORT,
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-    from: process.env.EMAIL_FROM,
-  },
+  email: {
+  apiKey: process.env.RESEND_API_KEY,
+  from: process.env.EMAIL_FROM || 'MindMitra <onboarding@resend.dev>',
+},
   geminiApiKey: process.env.GEMINI_API_KEY,
   rateLimit: {
     windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
