@@ -5,7 +5,7 @@ import { authApi } from '../services/auth.api';
 import { getAccessToken, setAccessToken } from '../services/axiosInstance';
 
 const SocketContext = createContext(null);
-const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:5000';
+const SOCKET_URL = import.meta.env.VITE_SOCKET_URL;
 
 export const SocketProvider = ({ children }) => {
   const { user } = useAuth();
