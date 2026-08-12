@@ -11,23 +11,63 @@ const userSocketMap = new Map(); // userId -> socketId (current live socket for 
 // going permanently dead after a single reconnect.
 const sessionParticipants = new Map();
 
-// Default public STUN server plus any operator-supplied servers (including
-// TURN, which is required for peers behind restrictive/symmetric NATs or
-// corporate firewalls — STUN alone cannot traverse those). Previously
-// ICE_SERVERS was parsed from env but only stashed on `io._iceServers` for
-// debugging; it was never actually sent to clients, so custom/TURN servers
-// had no effect and calls across such networks would silently fail to
-// connect while still working fine on the same LAN or over localhost.
-const getIceServers = () => {
-  const defaults = [{ urls: 'stun:stun.l.google.com:19302' }];
-  if (!env.iceServers) return defaults;
+// Default public STUN server, used only as a last-resort fallback when no
+// TURN provider is configured or reachable. STUN alone cannot traverse
+// symmetric NATs (very common on mobile data and many home routers), so
+// calls between users on different networks will fail without real TURN
+// credentials below.
+const DEFAULT_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+// Metered issues short-lived, rotating TURN credentials via this API rather
+// than a fixed username/password — safer than baking static creds into an
+// env var, since anyone can read ICE candidates off the wire. We fetch
+// server-side (the API key never reaches the browser) and cache briefly to
+// avoid a network round trip on every session:join.
+let meteredCache = { servers: null, fetchedAt: 0 };
+const METERED_CACHE_TTL_MS = 20 * 60 * 1000; // 20 minutes
+
+const fetchMeteredIceServers = async () => {
+  const now = Date.now();
+  if (meteredCache.servers && now - meteredCache.fetchedAt < METERED_CACHE_TTL_MS) {
+    return meteredCache.servers;
+  }
+
+  const url = `https://${env.metered.domain}/api/v1/turn/credentials?apiKey=${env.metered.apiKey}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Metered credentials request failed: ${res.status}`);
+  }
+  const servers = await res.json();
+  if (!Array.isArray(servers) || !servers.length) {
+    throw new Error('Metered returned an empty credentials list');
+  }
+  meteredCache = { servers, fetchedAt: now };
+  return servers;
+};
+
+// Static fallback: a raw JSON array of ICE servers (STUN and/or TURN with
+// fixed long-lived credentials) supplied directly via env, for anyone not
+// using Metered.
+const getStaticIceServers = () => {
+  if (!env.iceServers) return DEFAULT_ICE_SERVERS;
   try {
     const parsed = JSON.parse(env.iceServers);
-    return Array.isArray(parsed) && parsed.length ? parsed : defaults;
+    return Array.isArray(parsed) && parsed.length ? parsed : DEFAULT_ICE_SERVERS;
   } catch (err) {
     logger.warn('Failed to parse ICE_SERVERS env var, falling back to default STUN');
-    return defaults;
+    return DEFAULT_ICE_SERVERS;
   }
+};
+
+const getIceServers = async () => {
+  if (env.metered.domain && env.metered.apiKey) {
+    try {
+      return await fetchMeteredIceServers();
+    } catch (err) {
+      logger.error('Failed to fetch Metered TURN credentials, falling back:', err.message);
+    }
+  }
+  return getStaticIceServers();
 };
 
 const initSocket = (httpServer) => {
@@ -66,7 +106,7 @@ const initSocket = (httpServer) => {
         socket.join(`session:${sessionId}`);
         socket.joinedSessionIds.add(sessionId);
         logger.info(`Session joined: user ${uid} joined room session:${sessionId}`);
-        socket.emit('session:joined', { sessionId, iceServers: getIceServers() });
+        socket.emit('session:joined', { sessionId, iceServers: await getIceServers() });
 
         if (!sessionParticipants.has(sessionId)) sessionParticipants.set(sessionId, new Set());
         sessionParticipants.get(sessionId).add(uid);
