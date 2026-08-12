@@ -22,6 +22,13 @@ const SessionPage = () => {
   const [appointment, setAppointment] = useState(null);
   const [sessionReady, setSessionReady] = useState(false);
   const [peerLeft, setPeerLeft] = useState(false);
+  // Real WebRTC connection state (from RTCPeerConnection.connectionState):
+  // 'new' | 'connecting' | 'connected' | 'disconnected' | 'failed' | 'closed'.
+  // This is what actually reflects whether media is flowing — sessionReady
+  // only means both participants joined the signaling room, which can be
+  // true while the peer-to-peer media connection has failed (e.g. no TURN
+  // server available for a NAT type STUN can't traverse).
+  const [pcState, setPcState] = useState('new');
   const { user } = useAuth();
 
   const isCounselor = appointment && user && String(user._id) === String(appointment.counselor._id || appointment.counselor);
@@ -46,18 +53,24 @@ const SessionPage = () => {
     }
   }, []);
 
+  // Creates the RTCPeerConnection and attaches the local stream.
+  // Reuses existing camera/mic stream if we already have one (e.g.
+  // rebuilding the peer connection after the other participant
+  // reconnected) instead of prompting for camera permission again.
   const ensurePeerConnection = useCallback(async () => {
     if (pcRef.current) return pcRef.current;
 
-    // Reuse existing camera/mic stream if we already have one (e.g.
-    // rebuilding the peer connection after the other participant
-    // reconnected) instead of prompting for camera permission again.
     let stream = localStreamRef.current;
     if (!stream) {
-      stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      localStreamRef.current = stream;
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        localStreamRef.current = stream;
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = stream;
+        }
+      } catch (err) {
+        console.error('[SessionPage] getUserMedia failed:', err);
+        throw err;
       }
     }
 
@@ -75,25 +88,31 @@ const SessionPage = () => {
       if (evt.candidate && appointment) {
         const other = getOtherUserId();
         if (other) {
-          console.log('[SessionPage] Sending ICE candidate');
+          console.log('[SessionPage] Sending ICE candidate', evt.candidate.type, evt.candidate.candidate);
           socket.emit('webrtc:ice', { targetUserId: other, candidate: evt.candidate });
         }
       }
     };
 
-    // Connection state monitoring for debugging + auto ICE restart
+    // These fire on every ICE/connection transition. 'failed' here — with
+    // no TURN server configured — almost always means the peers are behind
+    // NAT types that STUN alone can't traverse (very common across
+    // different networks/mobile data), and a TURN relay is required.
     pc.onconnectionstatechange = () => {
-      console.log('[SessionPage] Connection state:', pc.connectionState);
+      console.log('[SessionPage] connectionState:', pc.connectionState);
+      setPcState(pc.connectionState);
       if (pc.connectionState === 'failed') {
-        console.error('[SessionPage] WebRTC connection failed - restarting ICE');
+        console.error('[SessionPage] Peer connection failed — likely missing TURN server for this NAT type');
+        // Auto ICE restart to attempt recovery
         pc.restartIce();
       }
     };
 
     pc.oniceconnectionstatechange = () => {
-      console.log('[SessionPage] ICE state:', pc.iceConnectionState);
+      console.log('[SessionPage] iceConnectionState:', pc.iceConnectionState);
     };
 
+    setPcState(pc.connectionState);
     return pc;
   }, [appointment, socket, getOtherUserId]);
 
@@ -119,6 +138,7 @@ const SessionPage = () => {
       pcRef.current = null;
     }
     pendingIceRef.current = [];
+    setPcState('new');
     if (remoteVideoRef.current?.srcObject) {
       remoteVideoRef.current.srcObject.getTracks().forEach((track) => track.stop());
       remoteVideoRef.current.srcObject = null;
@@ -295,15 +315,26 @@ const SessionPage = () => {
 
   const statusLabel = peerLeft
     ? 'Other participant disconnected — waiting for them to rejoin…'
-    : sessionReady
+    : pcState === 'connected'
       ? 'Connected'
-      : 'Waiting for the other participant to join…';
+      : pcState === 'failed' || pcState === 'disconnected'
+        ? 'Connection failed — this network may need a TURN server'
+        : sessionReady
+          ? 'Connecting…'
+          : 'Waiting for the other participant to join…';
+
+  const badgeClass =
+    pcState === 'connected' && !peerLeft
+      ? 'badge-success'
+      : pcState === 'failed' || pcState === 'disconnected'
+        ? 'badge-error'
+        : 'badge-warning';
 
   return (
     <div className="max-w-4xl mx-auto py-8">
       <h1 className="text-xl font-semibold mb-4">Session: {sessionId}</h1>
       <div className="mb-4 flex items-center gap-3">
-        <span className={`badge ${sessionReady && !peerLeft ? 'badge-success' : 'badge-warning'}`}>{statusLabel}</span>
+        <span className={`badge ${badgeClass}`}>{statusLabel}</span>
         <button onClick={handleEnd} className="btn btn-ghost">End session</button>
       </div>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
