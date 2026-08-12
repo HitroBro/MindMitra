@@ -22,6 +22,8 @@ const SessionPage = () => {
   const [appointment, setAppointment] = useState(null);
   const [sessionReady, setSessionReady] = useState(false);
   const [peerLeft, setPeerLeft] = useState(false);
+  // Camera/mic state - requires explicit user action to start
+  const [mediaStarted, setMediaStarted] = useState(false);
   // Real WebRTC connection state (from RTCPeerConnection.connectionState):
   // 'new' | 'connecting' | 'connected' | 'disconnected' | 'failed' | 'closed'.
   // This is what actually reflects whether media is flowing — sessionReady
@@ -199,13 +201,17 @@ const SessionPage = () => {
       setPeerLeft(false);
       setSessionReady(true);
 
-      // Ensure peer connection is ready before creating offer (for counselor)
-      await initPeerConnection();
-      if (isCounselor) {
-        console.log('[SessionPage] Counselor is initiator and will create offer');
-        createOfferAndSend();
+      // Only initialize peer connection if media has been started by user
+      if (mediaStarted) {
+        await initPeerConnection();
+        if (isCounselor) {
+          console.log('[SessionPage] Counselor is initiator and will create offer');
+          createOfferAndSend();
+        } else {
+          console.log('[SessionPage] Student is waiting for offer');
+        }
       } else {
-        console.log('[SessionPage] Student is waiting for offer');
+        console.log('[SessionPage] Waiting for user to start camera');
       }
     };
 
@@ -275,8 +281,10 @@ const SessionPage = () => {
     socket.on('webrtc:ice', handleIce);
 
     socket.emit('session:join', { sessionId });
-    // Don't fire-and-forget; initPeerConnection handles deduplication
-    initPeerConnection();
+    // Don't auto-init - wait for user to click "Start camera"
+    if (mediaStarted) {
+      initPeerConnection();
+    }
 
     return () => {
       socket.off('connect', handleSocketConnect);
@@ -287,7 +295,7 @@ const SessionPage = () => {
       socket.off('webrtc:answer', handleAnswer);
       socket.off('webrtc:ice', handleIce);
     };
-  }, [socket, appointment, sessionId, isCounselor, ensurePeerConnection, createOfferAndSend, flushPendingIce, closePeerConnectionOnly]);
+  }, [socket, appointment, sessionId, isCounselor, mediaStarted, ensurePeerConnection, createOfferAndSend, flushPendingIce, closePeerConnectionOnly, handleStartMedia]);
 
   // Release the camera/mic and close the peer connection no matter how the
   // user leaves the page (back button, closing the tab, navigating
@@ -313,6 +321,24 @@ const SessionPage = () => {
     }
   };
 
+  // Handler for starting camera/mic - requires user gesture
+  const handleStartMedia = useCallback(async () => {
+    if (mediaStarted) return;
+    try {
+      setMediaStarted(true);
+      await ensurePeerConnection();
+      console.log('[SessionPage] Media started by user');
+      if (isCounselor && sessionReady) {
+        console.log('[SessionPage] Counselor creating offer after media start');
+        createOfferAndSend();
+      }
+    } catch (err) {
+      console.error('[SessionPage] Failed to start media:', err);
+      setMediaStarted(false);
+      alert('Failed to access camera/microphone. Please check permissions.');
+    }
+  }, [mediaStarted, isCounselor, sessionReady, ensurePeerConnection, createOfferAndSend]);
+
   const statusLabel = peerLeft
     ? 'Other participant disconnected — waiting for them to rejoin…'
     : pcState === 'connected'
@@ -335,6 +361,13 @@ const SessionPage = () => {
       <h1 className="text-xl font-semibold mb-4">Session: {sessionId}</h1>
       <div className="mb-4 flex items-center gap-3">
         <span className={`badge ${badgeClass}`}>{statusLabel}</span>
+        {!mediaStarted ? (
+          <button onClick={handleStartMedia} className="btn btn-primary">
+            Start camera & connect
+          </button>
+        ) : (
+          <span className="text-sm text-teal-700">Camera active</span>
+        )}
         <button onClick={handleEnd} className="btn btn-ghost">End session</button>
       </div>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
