@@ -19,11 +19,8 @@ export const SocketProvider = ({ children }) => {
       return;
     }
 
-    const token = getAccessToken();
-    if (!token) return;
-
     const newSocket = io(SOCKET_URL, {
-      auth: { token },
+      auth: (cb) => cb({ token: getAccessToken() }),
       transports: ['websocket'],
       autoConnect: true,
     });
