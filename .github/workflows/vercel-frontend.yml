@@ -2,7 +2,7 @@ name: Deploy Frontend to Vercel
 
 on:
   push:
-    branches: [fix/webrtc-session-video-issue]
+    branches: [main, fix/webrtc-session-video-issue]
   workflow_dispatch:
 
 jobs:
