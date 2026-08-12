@@ -1,0 +1,476 @@
+diff --git a/backend/render.yaml b/backend/render.yaml
+index 4936640..1c7250d 100644
+--- a/backend/render.yaml
++++ b/backend/render.yaml
+@@ -45,4 +45,13 @@ services:
+         sync: false
+ 
+       - key: EMAIL_FROM
+-        value: "MindMitra <onboarding@resend.dev>"
+\ No newline at end of file
++        value: "MindMitra <onboarding@resend.dev>"
++
++      - key: METERED_DOMAIN
++        sync: false
++
++      - key: METERED_API_KEY
++        sync: false
++
++      - key: ICE_SERVERS
++        sync: false
+\ No newline at end of file
+diff --git a/backend/src/config/env.js b/backend/src/config/env.js
+index bc57bbb..2c2bb3c 100644
+--- a/backend/src/config/env.js
++++ b/backend/src/config/env.js
+@@ -35,4 +35,11 @@ module.exports = {
+   },
+   // optional ICE servers (comma-separated JSON entries) e.g. [{"urls":"stun:stun.l.google.com:19302"}]
+   iceServers: process.env.ICE_SERVERS || '',
++  // Metered.ca TURN service — preferred over the static ICE_SERVERS above
++  // when both are set, since it issues short-lived rotating credentials
++  // fetched server-side instead of a fixed username/password baked into env.
++  metered: {
++    domain: process.env.METERED_DOMAIN || '',
++    apiKey: process.env.METERED_API_KEY || '',
++  },
+ };
+diff --git a/backend/src/socket/index.js b/backend/src/socket/index.js
+index a367104..ca955c2 100644
+--- a/backend/src/socket/index.js
++++ b/backend/src/socket/index.js
+@@ -4,26 +4,76 @@ const env = require('../config/env');
+ const logger = require('../utils/logger');
+ 
+ let io;
+-const userSocketMap = new Map(); // userId -> socketId
+-const sessionReadyRooms = new Set();
++const userSocketMap = new Map(); // userId -> socketId (current live socket for that user)
++// sessionId -> Set of userIds currently joined to that session's room.
++// Tracking membership (not just a "ready" boolean) lets us detect a peer
++// leaving and re-fire session:ready when they rejoin, instead of a call
++// going permanently dead after a single reconnect.
++const sessionParticipants = new Map();
++
++// Default public STUN server, used only as a last-resort fallback when no
++// TURN provider is configured or reachable. STUN alone cannot traverse
++// symmetric NATs (very common on mobile data and many home routers), so
++// calls between users on different networks will fail without real TURN
++// credentials below.
++const DEFAULT_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
++
++// Metered issues short-lived, rotating TURN credentials via this API rather
++// than a fixed username/password — safer than baking static creds into an
++// env var, since anyone can read ICE candidates off the wire. We fetch
++// server-side (the API key never reaches the browser) and cache briefly to
++// avoid a network round trip on every session:join.
++let meteredCache = { servers: null, fetchedAt: 0 };
++const METERED_CACHE_TTL_MS = 20 * 60 * 1000; // 20 minutes
++
++const fetchMeteredIceServers = async () => {
++  const now = Date.now();
++  if (meteredCache.servers && now - meteredCache.fetchedAt < METERED_CACHE_TTL_MS) {
++    return meteredCache.servers;
++  }
+ 
+-const initSocket = (httpServer) => {
+-  io = new Server(httpServer, {
+-    cors: { origin: env.clientUrl, credentials: true },
+-  });
++  const url = `https://${env.metered.domain}/api/v1/turn/credentials?apiKey=${env.metered.apiKey}`;
++  const res = await fetch(url);
++  if (!res.ok) {
++    throw new Error(`Metered credentials request failed: ${res.status}`);
++  }
++  const servers = await res.json();
++  if (!Array.isArray(servers) || !servers.length) {
++    throw new Error('Metered returned an empty credentials list');
++  }
++  meteredCache = { servers, fetchedAt: now };
++  return servers;
++};
+ 
+-  // Configure ICE servers if provided in env
++// Static fallback: a raw JSON array of ICE servers (STUN and/or TURN with
++// fixed long-lived credentials) supplied directly via env, for anyone not
++// using Metered.
++const getStaticIceServers = () => {
++  if (!env.iceServers) return DEFAULT_ICE_SERVERS;
+   try {
+-    const iceRaw = env.iceServers;
+-    if (iceRaw) {
+-      // parse JSON array from env if present
+-      const parsed = JSON.parse(iceRaw);
+-      io._iceServers = parsed; // store for reference; not a standard field but useful for debugging
+-      logger.info('Configured custom ICE servers for WebRTC');
+-    }
++    const parsed = JSON.parse(env.iceServers);
++    return Array.isArray(parsed) && parsed.length ? parsed : DEFAULT_ICE_SERVERS;
+   } catch (err) {
+-    logger.warn('Failed to parse ICE_SERVERS env var');
++    logger.warn('Failed to parse ICE_SERVERS env var, falling back to default STUN');
++    return DEFAULT_ICE_SERVERS;
++  }
++};
++
++const getIceServers = async () => {
++  if (env.metered.domain && env.metered.apiKey) {
++    try {
++      return await fetchMeteredIceServers();
++    } catch (err) {
++      logger.error('Failed to fetch Metered TURN credentials, falling back:', err.message);
++    }
+   }
++  return getStaticIceServers();
++};
++
++const initSocket = (httpServer) => {
++  io = new Server(httpServer, {
++    cors: { origin: env.clientUrl, credentials: true },
++  });
+ 
+   io.use((socket, next) => {
+     try {
+@@ -39,6 +89,7 @@ const initSocket = (httpServer) => {
+ 
+   io.on('connection', (socket) => {
+     userSocketMap.set(socket.userId, socket.id);
++    socket.joinedSessionIds = new Set();
+     logger.info(`Socket connected: user ${socket.userId}`);
+ 
+     // Join a session room when client requests — validate session ownership
+@@ -53,17 +104,19 @@ const initSocket = (httpServer) => {
+         if (uid !== studentId && uid !== counselorId) return socket.emit('session:error', { message: 'Not a participant' });
+ 
+         socket.join(`session:${sessionId}`);
++        socket.joinedSessionIds.add(sessionId);
+         logger.info(`Session joined: user ${uid} joined room session:${sessionId}`);
+-        socket.emit('session:joined', { sessionId });
++        socket.emit('session:joined', { sessionId, iceServers: await getIceServers() });
+ 
+-        const clients = await io.in(`session:${sessionId}`).fetchSockets();
+-        const participantCount = clients.filter((s) => {
+-          const user = String(s.userId);
+-          return user === studentId || user === counselorId;
+-        }).length;
++        if (!sessionParticipants.has(sessionId)) sessionParticipants.set(sessionId, new Set());
++        sessionParticipants.get(sessionId).add(uid);
++        const participantCount = sessionParticipants.get(sessionId).size;
+ 
+-        if (participantCount === 2 && !sessionReadyRooms.has(sessionId)) {
+-          sessionReadyRooms.add(sessionId);
++        // Re-fire every time both participants are present — not just the
++        // first time — so a peer who reconnects (network blip, refresh)
++        // still triggers a fresh offer/answer exchange instead of leaving
++        // the call permanently frozen.
++        if (participantCount === 2) {
+           logger.info(`Session ready: session:${sessionId}`);
+           io.in(`session:${sessionId}`).emit('session:ready', { sessionId });
+         }
+@@ -74,7 +127,31 @@ const initSocket = (httpServer) => {
+     });
+ 
+     socket.on('disconnect', () => {
+-      userSocketMap.delete(socket.userId);
++      // Only clear the mapping if it still points at this socket. If the
++      // user already reconnected (new socket registered first), this
++      // disconnect event fires for the *old* socket and must not wipe out
++      // the live one — that race was silently breaking signaling relay to
++      // reconnected users.
++      if (userSocketMap.get(socket.userId) === socket.id) {
++        userSocketMap.delete(socket.userId);
++      }
++
++      const uid = String(socket.userId);
++      for (const sessionId of socket.joinedSessionIds) {
++        const participants = sessionParticipants.get(sessionId);
++        if (!participants) continue;
++        participants.delete(uid);
++        if (participants.size === 0) {
++          sessionParticipants.delete(sessionId);
++        } else {
++          // Let the remaining participant know their peer dropped, so the
++          // frontend can close/reset its RTCPeerConnection instead of
++          // sitting on a frozen remote video with no explanation.
++          io.in(`session:${sessionId}`).emit('session:peer-left', { sessionId });
++        }
++      }
++
++      logger.info(`Socket disconnected: user ${socket.userId}`);
+     });
+ 
+     // WebRTC signaling relay: clients send messages with { targetUserId, payload }
+diff --git a/frontend/src/contexts/SocketContext.jsx b/frontend/src/contexts/SocketContext.jsx
+index 8bff11b..7efbf22 100644
+--- a/frontend/src/contexts/SocketContext.jsx
++++ b/frontend/src/contexts/SocketContext.jsx
+@@ -19,11 +19,8 @@ export const SocketProvider = ({ children }) => {
+       return;
+     }
+ 
+-    const token = getAccessToken();
+-    if (!token) return;
+-
+     const newSocket = io(SOCKET_URL, {
+-      auth: { token },
++      auth: (cb) => cb({ token: getAccessToken() }),
+       transports: ['websocket'],
+       autoConnect: true,
+     });
+diff --git a/frontend/src/pages/session/SessionPage.jsx b/frontend/src/pages/session/SessionPage.jsx
+index 46f6dc6..85c6f06 100644
+--- a/frontend/src/pages/session/SessionPage.jsx
++++ b/frontend/src/pages/session/SessionPage.jsx
+@@ -4,6 +4,8 @@ import { useSocket } from '../../contexts/SocketContext';
+ import { useAuth } from '../../contexts/AuthContext';
+ import { appointmentApi } from '../../services/appointment.api';
+ 
++const DEFAULT_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
++
+ const SessionPage = () => {
+   const { sessionId } = useParams();
+   const navigate = useNavigate();
+@@ -11,11 +13,22 @@ const SessionPage = () => {
+   const localVideoRef = useRef(null);
+   const remoteVideoRef = useRef(null);
+   const pcRef = useRef(null);
++  const localStreamRef = useRef(null);
+   const pendingIceRef = useRef([]);
++  // ICE servers (including any TURN config) sent by the backend on
++  // session:joined. Kept in a ref (not state) since it's only read inside
++  // callbacks, never rendered.
++  const iceServersRef = useRef(DEFAULT_ICE_SERVERS);
+   const [appointment, setAppointment] = useState(null);
+-  const [sessionJoined, setSessionJoined] = useState(false);
+   const [sessionReady, setSessionReady] = useState(false);
+-  const [started, setStarted] = useState(false);
++  const [peerLeft, setPeerLeft] = useState(false);
++  // Real WebRTC connection state (from RTCPeerConnection.connectionState):
++  // 'new' | 'connecting' | 'connected' | 'disconnected' | 'failed' | 'closed'.
++  // This is what actually reflects whether media is flowing — sessionReady
++  // only means both participants joined the signaling room, which can be
++  // true while the peer-to-peer media connection has failed (e.g. no TURN
++  // server available for a NAT type STUN can't traverse).
++  const [pcState, setPcState] = useState('new');
+   const { user } = useAuth();
+ 
+   const isCounselor = appointment && user && String(user._id) === String(appointment.counselor._id || appointment.counselor);
+@@ -32,19 +45,35 @@ const SessionPage = () => {
+   useEffect(() => {
+     if (!socket || !appointment) return undefined;
+ 
+-    const handleSessionJoined = ({ sessionId: id }) => {
++    const handleSessionJoined = ({ sessionId: id, iceServers }) => {
+       console.log('[SessionPage] Joined session', id);
+-      setSessionJoined(true);
++      if (Array.isArray(iceServers) && iceServers.length) {
++        iceServersRef.current = iceServers;
++      }
+     };
+ 
+     const handleSessionReady = ({ sessionId: id }) => {
+       console.log('[SessionPage] Session ready', id);
++      setPeerLeft(false);
+       setSessionReady(true);
+     };
+ 
++    // The backend emits this when the other participant disconnects
++    // (network blip, tab closed, refresh). Tear down just the peer
++    // connection — keep the local camera running — so that when the
++    // backend re-emits session:ready on their rejoin, a fresh
++    // offer/answer exchange can happen instead of the call staying
++    // frozen on the old, now-dead connection.
++    const handlePeerLeft = () => {
++      console.log('[SessionPage] Peer left the session');
++      setPeerLeft(true);
++      setSessionReady(false);
++      closePeerConnectionOnly();
++    };
++
+     const handleOffer = async ({ fromUserId, offer }) => {
+       console.log('[SessionPage] Offer received', { fromUserId });
+-      await ensurePeerConnection(false);
++      await ensurePeerConnection();
+ 
+       const pc = pcRef.current;
+       if (!pc) return;
+@@ -89,17 +118,19 @@ const SessionPage = () => {
+     socket.on('connect', handleSocketConnect);
+     socket.on('session:joined', handleSessionJoined);
+     socket.on('session:ready', handleSessionReady);
++    socket.on('session:peer-left', handlePeerLeft);
+     socket.on('webrtc:offer', handleOffer);
+     socket.on('webrtc:answer', handleAnswer);
+     socket.on('webrtc:ice', handleIce);
+ 
+     socket.emit('session:join', { sessionId });
+-    ensurePeerConnection(false).catch((err) => console.error('[SessionPage] Failed to initialize peer connection', err));
++    ensurePeerConnection().catch((err) => console.error('[SessionPage] Failed to initialize peer connection', err));
+ 
+     return () => {
+       socket.off('connect', handleSocketConnect);
+       socket.off('session:joined', handleSessionJoined);
+       socket.off('session:ready', handleSessionReady);
++      socket.off('session:peer-left', handlePeerLeft);
+       socket.off('webrtc:offer', handleOffer);
+       socket.off('webrtc:answer', handleAnswer);
+       socket.off('webrtc:ice', handleIce);
+@@ -118,6 +149,17 @@ const SessionPage = () => {
+     }
+   }, [sessionReady, isCounselor]);
+ 
++  // Release the camera/mic and close the peer connection no matter how the
++  // user leaves the page (back button, closing the tab, navigating
++  // elsewhere in the SPA) — not just via the explicit "End session" button.
++  // Previously this cleanup only ran inside handleEnd, so any other exit
++  // path left the camera light on and the RTCPeerConnection open.
++  useEffect(() => {
++    return () => {
++      stopTracksAndClosePeer();
++    };
++  }, []);
++
+   const getOtherUserId = () => {
+     if (!appointment || !user) return null;
+     const studentId = appointment.student._id || appointment.student;
+@@ -138,16 +180,24 @@ const SessionPage = () => {
+     }
+   };
+ 
+-  const ensurePeerConnection = async (isInitiator) => {
++  const ensurePeerConnection = async () => {
+     if (pcRef.current) return pcRef.current;
+ 
+-    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+-    if (localVideoRef.current) {
+-      localVideoRef.current.srcObject = stream;
++    // Reuse the existing camera/mic stream if we already have one (e.g.
++    // rebuilding the peer connection after the other participant
++    // reconnected) instead of prompting for camera permission again.
++    let stream = localStreamRef.current;
++    if (!stream) {
++      stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
++      localStreamRef.current = stream;
++      if (localVideoRef.current) {
++        localVideoRef.current.srcObject = stream;
++      }
+     }
+ 
+-    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
++    const pc = new RTCPeerConnection({ iceServers: iceServersRef.current });
+     pcRef.current = pc;
++    setPcState(pc.connectionState);
+ 
+     stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+ 
+@@ -160,19 +210,34 @@ const SessionPage = () => {
+       if (evt.candidate && appointment) {
+         const other = getOtherUserId();
+         if (other) {
+-          console.log('[SessionPage] Sending ICE candidate');
++          console.log('[SessionPage] Sending ICE candidate', evt.candidate.type, evt.candidate.candidate);
+           socket.emit('webrtc:ice', { targetUserId: other, candidate: evt.candidate });
+         }
+       }
+     };
+ 
+-    setStarted(true);
++    // These fire on every ICE/connection transition. 'failed' here — with
++    // no TURN server configured — almost always means the peers are behind
++    // NAT types that STUN alone can't traverse (very common across
++    // different networks/mobile data), and a TURN relay is required.
++    pc.onconnectionstatechange = () => {
++      console.log('[SessionPage] connectionState:', pc.connectionState);
++      setPcState(pc.connectionState);
++      if (pc.connectionState === 'failed') {
++        console.error('[SessionPage] Peer connection failed — likely missing TURN server for this NAT type');
++      }
++    };
++
++    pc.oniceconnectionstatechange = () => {
++      console.log('[SessionPage] iceConnectionState:', pc.iceConnectionState);
++    };
++
+     return pc;
+   };
+ 
+   const createOfferAndSend = async () => {
+     if (!appointment || !socket) return;
+-    const pc = await ensurePeerConnection(true);
++    const pc = await ensurePeerConnection();
+     const offer = await pc.createOffer();
+     await pc.setLocalDescription(offer);
+ 
+@@ -183,22 +248,35 @@ const SessionPage = () => {
+     socket.emit('webrtc:offer', { targetUserId: other, offer });
+   };
+ 
+-  const stopTracksAndClosePeer = () => {
++  // Closes just the RTCPeerConnection — used when the remote peer drops so
++  // we can rebuild the connection on their rejoin without losing our own
++  // camera feed or re-prompting for permission.
++  const closePeerConnectionOnly = () => {
+     if (pcRef.current) {
+-      pcRef.current.getSenders().forEach((s) => { if (s.track) s.track.stop(); });
+       pcRef.current.close();
+       pcRef.current = null;
+     }
+-    if (localVideoRef.current?.srcObject) {
+-      localVideoRef.current.srcObject.getTracks().forEach((track) => track.stop());
+-      localVideoRef.current.srcObject = null;
+-    }
++    pendingIceRef.current = [];
++    setPcState('new');
+     if (remoteVideoRef.current?.srcObject) {
+       remoteVideoRef.current.srcObject.getTracks().forEach((track) => track.stop());
+       remoteVideoRef.current.srcObject = null;
+     }
+   };
+ 
++  // Full teardown — stops the camera/mic and closes the peer connection.
++  // Used on "End session" and on unmount.
++  const stopTracksAndClosePeer = () => {
++    closePeerConnectionOnly();
++    if (localStreamRef.current) {
++      localStreamRef.current.getTracks().forEach((track) => track.stop());
++      localStreamRef.current = null;
++    }
++    if (localVideoRef.current?.srcObject) {
++      localVideoRef.current.srcObject = null;
++    }
++  };
++
+   const handleEnd = async () => {
+     try {
+       if (!appointment) return;
+@@ -211,11 +289,28 @@ const SessionPage = () => {
+     }
+   };
+ 
++  const statusLabel = peerLeft
++    ? 'Other participant disconnected — waiting for them to rejoin…'
++    : pcState === 'connected'
++      ? 'Connected'
++      : pcState === 'failed' || pcState === 'disconnected'
++        ? 'Connection failed — this network may need a TURN server'
++        : sessionReady
++          ? 'Connecting…'
++          : 'Waiting for the other participant to join…';
++
++  const badgeClass =
++    pcState === 'connected' && !peerLeft
++      ? 'badge-success'
++      : pcState === 'failed' || pcState === 'disconnected'
++        ? 'badge-error'
++        : 'badge-warning';
++
+   return (
+     <div className="max-w-4xl mx-auto py-8">
+       <h1 className="text-xl font-semibold mb-4">Session: {sessionId}</h1>
+-      <div className="mb-4">
+-        <button disabled className="btn btn-primary mr-2">Start camera & connect</button>
++      <div className="mb-4 flex items-center gap-3">
++        <span className={`badge ${badgeClass}`}>{statusLabel}</span>
+         <button onClick={handleEnd} className="btn btn-ghost">End session</button>
+       </div>
+       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
