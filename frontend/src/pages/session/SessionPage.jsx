@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useSocket } from '../../contexts/SocketContext';
 import { useAuth } from '../../contexts/AuthContext';
@@ -26,6 +26,119 @@ const SessionPage = () => {
 
   const isCounselor = appointment && user && String(user._id) === String(appointment.counselor._id || appointment.counselor);
 
+  const getOtherUserId = useCallback(() => {
+    if (!appointment || !user) return null;
+    const studentId = appointment.student._id || appointment.student;
+    const counselorId = appointment.counselor._id || appointment.counselor;
+    return String(studentId) === String(user._id) ? counselorId : studentId;
+  }, [appointment, user]);
+
+  const flushPendingIce = useCallback(async () => {
+    const pc = pcRef.current;
+    if (!pc || !pc.remoteDescription || !pc.remoteDescription.type) return;
+    while (pendingIceRef.current.length) {
+      const candidate = pendingIceRef.current.shift();
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (err) {
+        console.error('[SessionPage] Failed to flush queued ICE', err);
+      }
+    }
+  }, []);
+
+  const ensurePeerConnection = useCallback(async () => {
+    if (pcRef.current) return pcRef.current;
+
+    // Reuse existing camera/mic stream if we already have one (e.g.
+    // rebuilding the peer connection after the other participant
+    // reconnected) instead of prompting for camera permission again.
+    let stream = localStreamRef.current;
+    if (!stream) {
+      stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localStreamRef.current = stream;
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
+    }
+
+    const pc = new RTCPeerConnection({ iceServers: iceServersRef.current });
+    pcRef.current = pc;
+
+    stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+    pc.ontrack = (evt) => {
+      console.log('[SessionPage] Remote stream attached');
+      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = evt.streams[0];
+    };
+
+    pc.onicecandidate = (evt) => {
+      if (evt.candidate && appointment) {
+        const other = getOtherUserId();
+        if (other) {
+          console.log('[SessionPage] Sending ICE candidate');
+          socket.emit('webrtc:ice', { targetUserId: other, candidate: evt.candidate });
+        }
+      }
+    };
+
+    // Connection state monitoring for debugging + auto ICE restart
+    pc.onconnectionstatechange = () => {
+      console.log('[SessionPage] Connection state:', pc.connectionState);
+      if (pc.connectionState === 'failed') {
+        console.error('[SessionPage] WebRTC connection failed - restarting ICE');
+        pc.restartIce();
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log('[SessionPage] ICE state:', pc.iceConnectionState);
+    };
+
+    return pc;
+  }, [appointment, socket, getOtherUserId]);
+
+  const createOfferAndSend = useCallback(async () => {
+    if (!appointment || !socket) return;
+    const pc = await ensurePeerConnection();
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    const other = getOtherUserId();
+    if (!other) return;
+
+    console.log('[SessionPage] Creating offer and sending to', other);
+    socket.emit('webrtc:offer', { targetUserId: other, offer });
+  }, [appointment, socket, ensurePeerConnection, getOtherUserId]);
+
+  // Closes just the RTCPeerConnection — used when the remote peer drops so
+  // we can rebuild the connection on their rejoin without losing our own
+  // camera feed or re-prompting for permission.
+  const closePeerConnectionOnly = useCallback(() => {
+    if (pcRef.current) {
+      pcRef.current.close();
+      pcRef.current = null;
+    }
+    pendingIceRef.current = [];
+    if (remoteVideoRef.current?.srcObject) {
+      remoteVideoRef.current.srcObject.getTracks().forEach((track) => track.stop());
+      remoteVideoRef.current.srcObject = null;
+    }
+  }, []);
+
+  // Full teardown — stops the camera/mic and closes the peer connection.
+  // Used on "End session" and on unmount.
+  const stopTracksAndClosePeer = useCallback(() => {
+    closePeerConnectionOnly();
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
+    }
+    if (localVideoRef.current?.srcObject) {
+      localVideoRef.current.srcObject = null;
+    }
+  }, [closePeerConnectionOnly]);
+
+  // Fetch appointment on mount
   useEffect(() => {
     appointmentApi.getBySession(sessionId)
       .then((res) => setAppointment(res.data.data))
@@ -33,10 +146,26 @@ const SessionPage = () => {
         alert('Session not found or you are not a participant');
         navigate(-1);
       });
-  }, [sessionId]);
+  }, [sessionId, navigate]);
 
+  // Socket + WebRTC signaling
   useEffect(() => {
     if (!socket || !appointment) return undefined;
+
+    let peerConnectionInitialized = false;
+
+    const initPeerConnection = async () => {
+      if (peerConnectionInitialized) return;
+      peerConnectionInitialized = true;
+
+      try {
+        await ensurePeerConnection();
+        console.log('[SessionPage] Peer connection initialized');
+      } catch (err) {
+        console.error('[SessionPage] Failed to initialize peer connection', err);
+        peerConnectionInitialized = false; // Allow retry
+      }
+    };
 
     const handleSessionJoined = ({ sessionId: id, iceServers }) => {
       console.log('[SessionPage] Joined session', id);
@@ -45,10 +174,19 @@ const SessionPage = () => {
       }
     };
 
-    const handleSessionReady = ({ sessionId: id }) => {
+    const handleSessionReady = async ({ sessionId: id }) => {
       console.log('[SessionPage] Session ready', id);
       setPeerLeft(false);
       setSessionReady(true);
+
+      // Ensure peer connection is ready before creating offer (for counselor)
+      await initPeerConnection();
+      if (isCounselor) {
+        console.log('[SessionPage] Counselor is initiator and will create offer');
+        createOfferAndSend();
+      } else {
+        console.log('[SessionPage] Student is waiting for offer');
+      }
     };
 
     // The backend emits this when the other participant disconnects
@@ -66,7 +204,7 @@ const SessionPage = () => {
 
     const handleOffer = async ({ fromUserId, offer }) => {
       console.log('[SessionPage] Offer received', { fromUserId });
-      await ensurePeerConnection();
+      await initPeerConnection();
 
       const pc = pcRef.current;
       if (!pc) return;
@@ -79,8 +217,8 @@ const SessionPage = () => {
       console.log('[SessionPage] Answer sent', { targetUserId: fromUserId });
     };
 
-    const handleAnswer = async ({ answer }) => {
-      console.log('[SessionPage] Answer received');
+    const handleAnswer = async ({ fromUserId, answer }) => {
+      console.log('[SessionPage] Answer received from', fromUserId);
       const pc = pcRef.current;
       if (!pc) return;
       await pc.setRemoteDescription(new RTCSessionDescription(answer));
@@ -117,7 +255,8 @@ const SessionPage = () => {
     socket.on('webrtc:ice', handleIce);
 
     socket.emit('session:join', { sessionId });
-    ensurePeerConnection().catch((err) => console.error('[SessionPage] Failed to initialize peer connection', err));
+    // Don't fire-and-forget; initPeerConnection handles deduplication
+    initPeerConnection();
 
     return () => {
       socket.off('connect', handleSocketConnect);
@@ -128,19 +267,7 @@ const SessionPage = () => {
       socket.off('webrtc:answer', handleAnswer);
       socket.off('webrtc:ice', handleIce);
     };
-  }, [socket, appointment, sessionId]);
-
-  useEffect(() => {
-    if (sessionReady) {
-      console.log('[SessionPage] session:ready fired');
-      if (isCounselor) {
-        console.log('[SessionPage] Counselor is initiator and will create offer');
-        createOfferAndSend();
-      } else {
-        console.log('[SessionPage] Student is waiting for offer');
-      }
-    }
-  }, [sessionReady, isCounselor]);
+  }, [socket, appointment, sessionId, isCounselor, ensurePeerConnection, createOfferAndSend, flushPendingIce, closePeerConnectionOnly]);
 
   // Release the camera/mic and close the peer connection no matter how the
   // user leaves the page (back button, closing the tab, navigating
@@ -151,106 +278,7 @@ const SessionPage = () => {
     return () => {
       stopTracksAndClosePeer();
     };
-  }, []);
-
-  const getOtherUserId = () => {
-    if (!appointment || !user) return null;
-    const studentId = appointment.student._id || appointment.student;
-    const counselorId = appointment.counselor._id || appointment.counselor;
-    return String(studentId) === String(user._id) ? counselorId : studentId;
-  };
-
-  const flushPendingIce = async () => {
-    const pc = pcRef.current;
-    if (!pc || !pc.remoteDescription || !pc.remoteDescription.type) return;
-    while (pendingIceRef.current.length) {
-      const candidate = pendingIceRef.current.shift();
-      try {
-        await pc.addIceCandidate(new RTCIceCandidate(candidate));
-      } catch (err) {
-        console.error('[SessionPage] Failed to flush queued ICE', err);
-      }
-    }
-  };
-
-  const ensurePeerConnection = async () => {
-    if (pcRef.current) return pcRef.current;
-
-    // Reuse the existing camera/mic stream if we already have one (e.g.
-    // rebuilding the peer connection after the other participant
-    // reconnected) instead of prompting for camera permission again.
-    let stream = localStreamRef.current;
-    if (!stream) {
-      stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      localStreamRef.current = stream;
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
-      }
-    }
-
-    const pc = new RTCPeerConnection({ iceServers: iceServersRef.current });
-    pcRef.current = pc;
-
-    stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-
-    pc.ontrack = (evt) => {
-      console.log('[SessionPage] Remote stream attached');
-      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = evt.streams[0];
-    };
-
-    pc.onicecandidate = (evt) => {
-      if (evt.candidate && appointment) {
-        const other = getOtherUserId();
-        if (other) {
-          console.log('[SessionPage] Sending ICE candidate');
-          socket.emit('webrtc:ice', { targetUserId: other, candidate: evt.candidate });
-        }
-      }
-    };
-
-    return pc;
-  };
-
-  const createOfferAndSend = async () => {
-    if (!appointment || !socket) return;
-    const pc = await ensurePeerConnection();
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    const other = getOtherUserId();
-    if (!other) return;
-
-    console.log('[SessionPage] Creating offer and sending to', other);
-    socket.emit('webrtc:offer', { targetUserId: other, offer });
-  };
-
-  // Closes just the RTCPeerConnection — used when the remote peer drops so
-  // we can rebuild the connection on their rejoin without losing our own
-  // camera feed or re-prompting for permission.
-  const closePeerConnectionOnly = () => {
-    if (pcRef.current) {
-      pcRef.current.close();
-      pcRef.current = null;
-    }
-    pendingIceRef.current = [];
-    if (remoteVideoRef.current?.srcObject) {
-      remoteVideoRef.current.srcObject.getTracks().forEach((track) => track.stop());
-      remoteVideoRef.current.srcObject = null;
-    }
-  };
-
-  // Full teardown — stops the camera/mic and closes the peer connection.
-  // Used on "End session" and on unmount.
-  const stopTracksAndClosePeer = () => {
-    closePeerConnectionOnly();
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => track.stop());
-      localStreamRef.current = null;
-    }
-    if (localVideoRef.current?.srcObject) {
-      localVideoRef.current.srcObject = null;
-    }
-  };
+  }, [stopTracksAndClosePeer]);
 
   const handleEnd = async () => {
     try {
@@ -260,6 +288,7 @@ const SessionPage = () => {
       if (user?.role === 'counselor') navigate('/dashboard/counselor/appointments');
       else navigate('/dashboard/student/appointments');
     } catch (err) {
+      console.error('[SessionPage] handleEnd error:', err);
       alert('Failed to end session');
     }
   };
