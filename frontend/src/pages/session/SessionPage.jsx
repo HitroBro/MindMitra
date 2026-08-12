@@ -15,6 +15,11 @@ const SessionPage = () => {
   const pcRef = useRef(null);
   const localStreamRef = useRef(null);
   const pendingIceRef = useRef([]);
+  // Outgoing ICE candidates generated before the appointment is fetched.
+  // onicecandidate fires as soon as the PC is created, but appointment
+  // loads async — without this queue, early candidates are silently
+  // dropped, leaving one side with a black screen.
+  const outgoingIceRef = useRef([]);
   // ICE servers (including any TURN config) sent by the backend on
   // session:joined. Kept in a ref (not state) since it's only read inside
   // callbacks, never rendered.
@@ -31,6 +36,20 @@ const SessionPage = () => {
   // true while the peer-to-peer media connection has failed (e.g. no TURN
   // server available for a NAT type STUN can't traverse).
   const [pcState, setPcState] = useState('new');
+  // Real-time connection quality stats polled from RTCPeerConnection.getStats()
+  const [stats, setStats] = useState({
+    bitrate: 0,
+    packetsLost: 0,
+    packetsReceived: 0,
+    roundTripTime: null,
+    iceCandidateType: null,
+    iceConnectionState: null,
+    remoteResolution: null,
+    remoteFps: null,
+  });
+  const [showStats, setShowStats] = useState(false);
+  const statsIntervalRef = useRef(null);
+  const prevBytesRef = useRef({ sent: 0, received: 0, timestamp: 0 });
   const { user } = useAuth();
 
   const isCounselor = appointment && user && String(user._id) === String(appointment.counselor._id || appointment.counselor);
@@ -54,6 +73,17 @@ const SessionPage = () => {
       }
     }
   }, []);
+
+  // Flush outgoing ICE candidates that were queued before appointment loaded.
+  const flushOutgoingIce = useCallback(() => {
+    if (!appointment || !socket) return;
+    const other = getOtherUserId();
+    if (!other) return;
+    while (outgoingIceRef.current.length) {
+      const candidate = outgoingIceRef.current.shift();
+      socket.emit('webrtc:ice', { targetUserId: other, candidate });
+    }
+  }, [appointment, socket, getOtherUserId]);
 
   // Creates the RTCPeerConnection and attaches the local stream.
   // Reuses existing camera/mic stream if we already have one (e.g.
@@ -87,11 +117,14 @@ const SessionPage = () => {
     };
 
     pc.onicecandidate = (evt) => {
-      if (evt.candidate && appointment) {
+      if (evt.candidate) {
         const other = getOtherUserId();
-        if (other) {
+        if (other && appointment) {
           console.log('[SessionPage] Sending ICE candidate', evt.candidate.type, evt.candidate.candidate);
           socket.emit('webrtc:ice', { targetUserId: other, candidate: evt.candidate });
+        } else {
+          // Queue until appointment loads so candidates aren't silently dropped
+          outgoingIceRef.current.push(evt.candidate);
         }
       }
     };
@@ -140,7 +173,14 @@ const SessionPage = () => {
       pcRef.current = null;
     }
     pendingIceRef.current = [];
+    outgoingIceRef.current = [];
+    prevBytesRef.current = { sent: 0, received: 0, timestamp: 0 };
     setPcState('new');
+    setStats({
+      bitrate: 0, packetsLost: 0, packetsReceived: 0,
+      roundTripTime: null, iceCandidateType: null, iceConnectionState: null,
+      remoteResolution: null, remoteFps: null,
+    });
     if (remoteVideoRef.current?.srcObject) {
       remoteVideoRef.current.srcObject.getTracks().forEach((track) => track.stop());
       remoteVideoRef.current.srcObject = null;
@@ -201,6 +241,9 @@ const SessionPage = () => {
       setPeerLeft(false);
       setSessionReady(true);
 
+      // Flush any outgoing ICE candidates that were queued before appointment loaded
+      flushOutgoingIce();
+
       // Only initialize peer connection if media has been started by user
       if (mediaStarted) {
         await initPeerConnection();
@@ -237,6 +280,9 @@ const SessionPage = () => {
 
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
       await flushPendingIce();
+      // Also flush any outgoing ICE candidates that were queued before
+      // the offer arrived (student started camera before counselor sent offer)
+      flushOutgoingIce();
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       socket.emit('webrtc:answer', { targetUserId: fromUserId, answer });
@@ -249,6 +295,7 @@ const SessionPage = () => {
       if (!pc) return;
       await pc.setRemoteDescription(new RTCSessionDescription(answer));
       flushPendingIce();
+      flushOutgoingIce();
     };
 
     const handleIce = async ({ candidate }) => {
@@ -295,7 +342,7 @@ const SessionPage = () => {
       socket.off('webrtc:answer', handleAnswer);
       socket.off('webrtc:ice', handleIce);
     };
-  }, [socket, appointment, sessionId, isCounselor, mediaStarted, ensurePeerConnection, createOfferAndSend, flushPendingIce, closePeerConnectionOnly, handleStartMedia]);
+  }, [socket, appointment, sessionId, isCounselor, mediaStarted, ensurePeerConnection, createOfferAndSend, flushPendingIce, flushOutgoingIce, closePeerConnectionOnly, handleStartMedia]);
 
   // Release the camera/mic and close the peer connection no matter how the
   // user leaves the page (back button, closing the tab, navigating
@@ -322,11 +369,95 @@ const SessionPage = () => {
   };
 
   // Handler for starting camera/mic - requires user gesture
+  // Poll RTCPeerConnection.getStats() every 2s for connection quality metrics
+  useEffect(() => {
+    if (!mediaStarted) {
+      if (statsIntervalRef.current) clearInterval(statsIntervalRef.current);
+      return;
+    }
+
+    statsIntervalRef.current = setInterval(async () => {
+      const pc = pcRef.current;
+      if (!pc || pc.connectionState === 'closed') return;
+
+      try {
+        const report = await pc.getStats();
+        let bytesSent = 0;
+        let bytesReceived = 0;
+        let packetsLost = 0;
+        let packetsReceived = 0;
+        let roundTripTime = null;
+        let iceCandidateType = null;
+        let remoteResolution = null;
+        let remoteFps = null;
+        let currentTimestamp = 0;
+
+        report.forEach((entry) => {
+          if (entry.type === 'candidate-pair' && entry.nominated) {
+            bytesSent = entry.bytesSent || 0;
+            bytesReceived = entry.bytesReceived || 0;
+            currentTimestamp = entry.timestamp || Date.now();
+            if (entry.currentRoundTripTime != null) {
+              roundTripTime = Math.round(entry.currentRoundTripTime * 1000); // ms
+            }
+            // Get ICE candidate type from the local candidate referenced by the
+            // nominated pair — more reliable than scanning all local-candidate entries
+            if (entry.localCandidateId) {
+              const localCandidate = report.get(entry.localCandidateId);
+              if (localCandidate && localCandidate.candidateType) {
+                iceCandidateType = localCandidate.candidateType;
+              }
+            }
+          }
+
+          if (entry.type === 'inbound-rtp' && entry.kind === 'video') {
+            packetsLost = entry.packetsLost || 0;
+            packetsReceived = entry.packetsReceived || 0;
+            remoteFps = entry.framesPerSecond || null;
+            if (entry.frameWidth && entry.frameHeight) {
+              remoteResolution = `${entry.frameWidth}×${entry.frameHeight}`;
+            }
+          }
+        });
+
+        // Calculate bitrate from delta
+        const prev = prevBytesRef.current;
+        let bitrate = 0;
+        if (currentTimestamp > prev.timestamp) {
+          const elapsedSec = (currentTimestamp - prev.timestamp) / 1000;
+          if (elapsedSec > 0 && prev.timestamp > 0) {
+            bitrate = Math.round(((bytesSent - prev.sent) * 8) / elapsedSec / 1000); // kbps
+          }
+        }
+        // Always update — on first valid poll this seeds the baseline
+        prevBytesRef.current = { sent: bytesSent, received: bytesReceived, timestamp: currentTimestamp };
+
+        setStats({
+          bitrate: Math.max(0, bitrate),
+          packetsLost,
+          packetsReceived,
+          roundTripTime,
+          iceCandidateType,
+          iceConnectionState: pc.iceConnectionState,
+          remoteResolution,
+          remoteFps,
+        });
+      } catch (err) {
+        console.error('[SessionPage] getStats error:', err);
+      }
+    }, 2000);
+
+    return () => {
+      if (statsIntervalRef.current) clearInterval(statsIntervalRef.current);
+    };
+  }, [mediaStarted]);
+
   const handleStartMedia = useCallback(async () => {
     if (mediaStarted) return;
     try {
       setMediaStarted(true);
       await ensurePeerConnection();
+      flushOutgoingIce();
       console.log('[SessionPage] Media started by user');
       if (isCounselor && sessionReady) {
         console.log('[SessionPage] Counselor creating offer after media start');
@@ -337,7 +468,7 @@ const SessionPage = () => {
       setMediaStarted(false);
       alert('Failed to access camera/microphone. Please check permissions.');
     }
-  }, [mediaStarted, isCounselor, sessionReady, ensurePeerConnection, createOfferAndSend]);
+  }, [mediaStarted, isCounselor, sessionReady, ensurePeerConnection, createOfferAndSend, flushOutgoingIce]);
 
   const statusLabel = peerLeft
     ? 'Other participant disconnected — waiting for them to rejoin…'
@@ -379,6 +510,78 @@ const SessionPage = () => {
           <p className="text-sm text-teal-700 mb-2">Remote</p>
           <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-64 bg-black rounded" />
         </div>
+      </div>
+
+      {/* Connection Quality Stats Panel */}
+      <div className="mt-4">
+        <button
+          onClick={() => setShowStats(!showStats)}
+          className="text-xs text-teal-600/70 hover:text-teal-700 flex items-center gap-1 transition-colors"
+        >
+          <svg
+            className={`w-3 h-3 transition-transform ${showStats ? 'rotate-90' : ''}`}
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+          </svg>
+          Connection stats
+        </button>
+
+        {showStats && (
+          <div className="mt-2 bg-white rounded-lg p-4 shadow text-xs font-mono text-teal-800 grid grid-cols-2 md:grid-cols-4 gap-3">
+            <div>
+              <span className="text-teal-500 block mb-0.5">Bitrate</span>
+              <span className="font-semibold text-sm">{stats.bitrate} kbps</span>
+            </div>
+            <div>
+              <span className="text-teal-500 block mb-0.5">RTT</span>
+              <span className="font-semibold text-sm">
+                {stats.roundTripTime != null ? `${stats.roundTripTime} ms` : '—'}
+              </span>
+            </div>
+            <div>
+              <span className="text-teal-500 block mb-0.5">ICE Type</span>
+              <span className="font-semibold text-sm capitalize">
+                {stats.iceCandidateType || '—'}
+              </span>
+            </div>
+            <div>
+              <span className="text-teal-500 block mb-0.5">Connection</span>
+              <span className="font-semibold text-sm capitalize">
+                {stats.iceConnectionState || pcState}
+              </span>
+            </div>
+            <div>
+              <span className="text-teal-500 block mb-0.5">Resolution</span>
+              <span className="font-semibold text-sm">
+                {stats.remoteResolution || '—'}
+              </span>
+            </div>
+            <div>
+              <span className="text-teal-500 block mb-0.5">FPS</span>
+              <span className="font-semibold text-sm">
+                {stats.remoteFps != null ? stats.remoteFps : '—'}
+              </span>
+            </div>
+            <div>
+              <span className="text-teal-500 block mb-0.5">Packets Lost</span>
+              <span className="font-semibold text-sm">
+                {stats.packetsLost}
+                {stats.packetsReceived > 0 && (
+                  <span className="text-teal-400 ml-1">
+                    ({((stats.packetsLost / (stats.packetsLost + stats.packetsReceived)) * 100).toFixed(1)}%)
+                  </span>
+                )}
+              </span>
+            </div>
+            <div>
+              <span className="text-teal-500 block mb-0.5">Packets Recv</span>
+              <span className="font-semibold text-sm">{stats.packetsReceived}</span>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
